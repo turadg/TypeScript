@@ -201,6 +201,58 @@ func TestContentMapperBuildDetectsNewPhysicalSupplementalFile(t *testing.T) {
 	assert.Assert(t, strings.Contains(testSys.currentWrite.String(), "conflicts with an existing file"), testSys.currentWrite.String())
 }
 
+// A settled build must ignore virtual supplemental files, but still invalidate
+// when an ordinary dependency disappears or the mapper configuration changes.
+func TestContentMapperBuildMissingInputs(t *testing.T) {
+	t.Parallel()
+	const root = "/home/src/workspaces/project/"
+	const config = `{
+		"compilerOptions": { "incremental": true, "rewriteRelativeImportExtensions": true },
+		"files": ["app.vue"],
+		"contentMappers": [{ "package": "mapper", "extensions": [".vue"] }]
+	}`
+	input := &tscInput{files: FileMap{
+		root + "tsconfig.json":                    config,
+		root + "app.vue":                          `import { value } from "./dependency"; export { value };`,
+		root + "dependency.d.ts":                  `export declare const value: number;`,
+		root + "node_modules/mapper/package.json": contentmappertest.PackageJSON(contentmappertest.SupplementalMapper),
+	}}
+	testSys := newTestSys(input, false)
+	sys := &recordingContentMapperSystem{
+		TestSys: testSys,
+		spawner: &recordingContentMapperSpawner{inner: contentmappertest.NewSpawner()},
+	}
+	run := func() (tsc.ExitStatus, string) {
+		t.Helper()
+		testSys.clearOutput()
+		result := execute.CommandLine(t.Context(), sys, []string{"--build", "--verbose", "--pretty", "false", "--runExternalCode"}, testSys)
+		return result.Status, testSys.currentWrite.String()
+	}
+	status, output := run()
+	assert.Equal(t, status, tsc.ExitStatusSuccess, output)
+	buildInfo := testSys.readFileNoError(root + "tsconfig.tsbuildinfo")
+	assert.Assert(t, strings.Contains(buildInfo, "app.vue.0.ts"), buildInfo)
+	assert.Assert(t, strings.Contains(buildInfo, "dependency.d.ts"), buildInfo)
+	assert.Assert(t, !testSys.FS().FileExists(tspath.RootedFilePathFromNormalized(root+"app.vue.0.ts")))
+	status, output = run()
+	assert.Equal(t, status, tsc.ExitStatusSuccess, output)
+	assert.Assert(t, strings.Contains(output, "is up to date"), output)
+
+	testSys.writeFileNoError(root+"tsconfig.json", strings.Replace(config, `"extensions": [".vue"]`, `"extensions": [".vue"], "outputExtensions": {".vue": ".js"}`, 1))
+	status, output = run()
+	assert.Equal(t, status, tsc.ExitStatusSuccess, output)
+	assert.Assert(t, strings.Contains(output, "Building project"), output)
+	status, output = run()
+	assert.Equal(t, status, tsc.ExitStatusSuccess, output)
+	assert.Assert(t, strings.Contains(output, "is up to date"), output)
+
+	testSys.removeNoError(root + "dependency.d.ts")
+	status, output = run()
+	assert.Equal(t, status, tsc.ExitStatusDiagnosticsPresent_OutputsGenerated, output)
+	assert.Assert(t, strings.Contains(output, "Building project"), output)
+	assert.Assert(t, strings.Contains(output, "TS2307"), output)
+}
+
 func TestContentMapperBuildIdentityFailureExitStatus(t *testing.T) {
 	t.Parallel()
 	const packageJSONPath = "/home/src/workspaces/project/node_modules/mapper/package.json"
